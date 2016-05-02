@@ -23,7 +23,7 @@ if(WITH_TWEETNACL)
     )
 
   set(TWEETNACL_SOURCES
-    tweetnacl/src/tweetnacl.c 
+    tweetnacl/src/tweetnacl.c
     )
   if(WIN32)
   else()
@@ -619,6 +619,11 @@ else()
                              PUBLIC_HEADER "${public_headers}")
     endif()
     add_library(libzmq-static STATIC ${sources} ${public_headers} ${html-docs} ${readme-docs} ${zmq-pkgconfig})
+    target_include_directories(libzmq-static PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+        PRIVATE src
+    )
     set_target_properties(libzmq-static PROPERTIES
       PUBLIC_HEADER "${public_headers}"
       COMPILE_FLAGS "-DZMQ_STATIC"

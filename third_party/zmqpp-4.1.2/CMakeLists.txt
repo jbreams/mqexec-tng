@@ -31,11 +31,11 @@ endif()
 
 # If libzmq is build in the same cmake global project and we want to
 # depends on it instead of searching for libzmq in the system, we set this to true
-set( ZMQPP_LIBZMQ_CMAKE   false   CACHE BOOL "libzmq is build through cmake too" )
+set( ZMQPP_LIBZMQ_CMAKE   true   CACHE BOOL "libzmq is build through cmake too" )
 
 
 set( ZMQPP_BUILD_STATIC   true   CACHE BOOL "Build the ZMQPP static library" )
-set( ZMQPP_BUILD_SHARED   true   CACHE BOOL "Build the ZMQPP dynamic library" )
+set( ZMQPP_BUILD_SHARED   false   CACHE BOOL "Build the ZMQPP dynamic library" )
 
 set( ZMQPP_BUILD_EXAMPLES false   CACHE BOOL "Build the ZMQPP examples" )
 set( ZMQPP_BUILD_CLIENT   false   CACHE BOOL "Build the ZMQPP client" )
@@ -57,8 +57,10 @@ set( ZEROMQ_INCLUDE_DIR   ""      CACHE PATH "The include directory for ZMQ" )
 set( IS_TRAVIS_CI_BUILD   true    CACHE bool "Defines TRAVIS_CI_BUILD - Should the tests avoid running cases where memory is scarce." )
 
 # Find zmq.h and add its dir to the includes
-find_path(ZEROMQ_INCLUDE zmq.h PATHS ${ZEROMQ_INCLUDE_DIR})
-include_directories(${ZEROMQ_INCLUDE_DIR} ${ZEROMQ_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/src )
+if (NOT ZMQPP_LIBZMQ_CMAKE)
+  find_path(ZEROMQ_INCLUDE zmq.h PATHS ${ZEROMQ_INCLUDE_DIR})
+  include_directories(${ZEROMQ_INCLUDE_DIR} ${ZEROMQ_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/src )
+endif()
 
 # Do not run some tests when building on travis-ci (this cause oom error and kill the test
 # process)
@@ -112,6 +114,10 @@ if (ZMQPP_BUILD_STATIC)
   endif()
   list( APPEND INSTALL_TARGET_LIST zmqpp-static)
   set( LIB_TO_LINK_TO_EXAMPLES zmqpp-static )
+  target_include_directories(zmqpp-static INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<INSTALL_INTERFACE:include>
+  )
 endif() # ZMQPP_BUILD_STATIC
 
 # Shared lib
@@ -208,5 +214,5 @@ install(TARGETS ${INSTALL_TARGET_LIST}
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
 
-install(DIRECTORY src/zmqpp DESTINATION include/
+install(DIRECTORY src/zmqpp DESTINATION include/zmqpp
         FILES_MATCHING PATTERN "*.hpp")
