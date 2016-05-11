@@ -32,9 +32,11 @@ std::unique_ptr<zmqpp::auth> zmq_authenticator = nullptr;
 json config_file_obj;
 
 struct timeval doubleToTimeval(double v) {
+    struct timeval ret;
     double usec;
-    std::time_t sec = std::modf(v, &usec);
-    return {sec, static_cast<long int>(usec) * 100000};
+    ret.tv_sec = std::modf(v, &usec);
+    ret.tv_usec = static_cast<decltype(ret.tv_usec)>(usec) * 100000;
+    return ret;
 }
 }
 
@@ -88,6 +90,7 @@ int processIOEvent(int sd, int events, void* arg) {
             logit(NSLOG_RUNTIME_ERROR, TRUE, "Error receiving result from executor: %s", e.what());
         }
     }
+    return 0;
 }
 
 void initServer(std::string bind_point, std::string key_file_path, zmqpp::curve::keypair keys) {

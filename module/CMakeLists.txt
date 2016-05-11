@@ -3,6 +3,10 @@ set(NAGIOS_INCLUDE "/usr/include/nagios" CACHE PATH "The include path for Nagios
 
 set(CMAKE_CXX_STANDARD 11)
 
+if (APPLE)
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -undefined dynamic_lookup")
+endif()
+
 add_library(mqexec-tng SHARED)
 target_sources(mqexec-tng PRIVATE frontend.cpp backend.cpp)
 

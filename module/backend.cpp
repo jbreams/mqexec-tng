@@ -179,7 +179,7 @@ void processHostCheckInitiate(nebstruct_host_check_data* state) {
     job->command_line = std::string(processed_command);
     job->time_scheduled = state->timestamp.tv_sec;
     job->time_expires =
-        job->time_scheduled + (state->timeout > 0) ? (state->timeout) : (default_timeout);
+        job->time_scheduled + ((state->timeout > 0) ? (state->timeout) : (default_timeout));
 
     job->check_options = obj->check_options;
     job->check_type = state->check_type;
@@ -200,7 +200,7 @@ void processServiceCheckInitiate(nebstruct_service_check_data* state) {
     job->command_line = std::string(state->command_line);
     job->time_scheduled = state->timestamp.tv_sec;
     job->time_expires =
-        job->time_scheduled + (state->timeout > 0) ? (state->timeout) : (default_timeout);
+        job->time_scheduled + ((state->timeout > 0) ? (state->timeout) : (default_timeout));
 
     job->check_options = cri->check_options;
     job->check_type = state->check_type;
