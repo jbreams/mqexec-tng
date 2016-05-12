@@ -14,30 +14,28 @@
 #include "nagios.h"
 #endif
 
-#include "json.hpp"
+#include "cereal/cereal.hpp"
+#include "cereal/types/string.hpp"
+#include "cereal/types/memory.hpp"
+#include "cereal/types/chrono.hpp"
+#include "cereal/archives/portable_binary.hpp"
+
 #include "zmqpp/zmqpp.hpp"
 #include "zmqpp/curve.hpp"
 
-#include "common.h"
+#include "json.hpp"
+// for convenience
+ using json = nlohmann::json;
+
+#include "module.h"
 
 extern iobroker_set* nagios_iobs;
 
 namespace {
-// for convenience
-using json = nlohmann::json;
-
 std::unique_ptr<zmqpp::context> zmq_ctx = nullptr;
 std::unique_ptr<zmqpp::socket> server_socket = nullptr;
 std::unique_ptr<zmqpp::auth> zmq_authenticator = nullptr;
 json config_file_obj;
-
-struct timeval doubleToTimeval(double v) {
-    struct timeval ret;
-    double usec;
-    ret.tv_sec = std::modf(v, &usec);
-    ret.tv_usec = static_cast<decltype(ret.tv_usec)>(usec) * 100000;
-    return ret;
-}
 }
 
 void dispatchJob(JobPtr job, std::string executor) {
@@ -46,16 +44,13 @@ void dispatchJob(JobPtr job, std::string executor) {
 
     const auto job_id = getJobQueue()->addCheck(job);
     try {
-        const json req_json = {{"id", job_id},
-                               {"command_line", job->command_line},
-                               {"timeout", job->time_expires - job->time_scheduled},
-                               {"host_name", job->host_name},
-                               {"service_description", job->service_description}};
-
         zmqpp::message req_msg;
         req_msg.add(executor);
-        req_msg.add(req_json.dump());
+        std::ostringstream req_buffer;
 
+        cereal::PortableBinaryOutputArchive archive(req_buffer);
+        archive(job);
+        req_msg.add(req_buffer.str());
         server_socket->send(req_msg);
     } catch (std::exception e) {
         std::stringstream ss;
@@ -75,16 +70,12 @@ int processIOEvent(int sd, int events, void* arg) {
             if (raw_msg.parts() == 0)
                 continue;
 
-            json msg = json::parse(raw_msg.get(1));
-            const Result res{msg.at("output").get<std::string>(),
-                             msg.at("return_code").get<int>(),
-                             doubleToTimeval(msg.at("start_time").get<double>()),
-                             doubleToTimeval(msg.at("finish_time").get<double>()),
-                             msg.at("exited_ok").get<bool>(),
-                             msg.at("early_timeout").get<bool>()};
+            std::istringstream response_buf(raw_msg.get(1));
+            cereal::PortableBinaryInputArchive archive(response_buf);
 
-            uint64_t job_id = msg.at("id").get<uint64_t>();
-            const auto job = getJobQueue()->getCheck(job_id);
+            Result res;
+            archive(res);
+            const auto job = getJobQueue()->getCheck(res.id);
             processResult(job, res);
         } catch (std::exception e) {
             logit(NSLOG_RUNTIME_ERROR, TRUE, "Error receiving result from executor: %s", e.what());

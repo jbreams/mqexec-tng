@@ -7,8 +7,8 @@ if (APPLE)
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -undefined dynamic_lookup")
 endif()
 
-add_library(mqexec-tng SHARED)
-target_sources(mqexec-tng PRIVATE frontend.cpp backend.cpp)
+add_library(modmqexec-tng SHARED)
+target_sources(modmqexec-tng PRIVATE frontend.cpp backend.cpp)
 
-target_link_libraries(mqexec-tng zmqpp-static json)
+target_link_libraries(modmqexec-tng zmqpp-static cereal shared json)
 include_directories(${NAGIOS_INCLUDE})

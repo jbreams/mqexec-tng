@@ -15,7 +15,7 @@
 #include "broker.h"
 #include "neberrors.h"
 
-#include "common.h"
+#include "module.h"
 
 bool operator>(const JobWeakPtr& lhs, const JobWeakPtr& rhs) {
     auto rlhs = lhs.lock();
@@ -34,7 +34,7 @@ std::shared_ptr<JobQueue> getJobQueue() {
 }
 
 uint64_t JobQueue::next_id = 0;
-CheckMap JobQueue::_placeholder = CheckMap{};
+JobMap JobQueue::_placeholder = JobMap{};
 
 int64_t default_timeout = 120;
 
@@ -47,22 +47,20 @@ struct check_engine mqexec_check_engine = {
     const_cast<char*>(engine_name), mqexec_source_name, std::free};
 
 void processJobError(JobPtr job, std::string errmsg) {
-    const Result res = {errmsg,
+    const Result res = {job->id,
+                        errmsg,
                         job->service_description.empty() ? 3 : 1,
-                        {job->time_scheduled, 0},
-                        {std::time(nullptr), 0},
-                        1,
-                        0};
+                        job->time_scheduled,
+                        std::chrono::system_clock::now()};
     processResult(job, res);
 }
 
 void processTimeout(JobPtr job) {
-    const Result res = {"Check timed out",
+    const Result res = {job->id,
+                        "Check timed out",
                         job->service_description.empty() ? 3 : 1,
-                        {job->time_scheduled, 0},
-                        {std::time(nullptr), 0},
-                        1,
-                        0};
+                        job->time_scheduled,
+                        std::chrono::system_clock::now()};
     processResult(job, res);
 }
 
@@ -91,11 +89,11 @@ void processResult(JobPtr job, const Result& result) {
     }
 
     new_result.output = strdup(result.output.c_str());
-    new_result.start_time = result.start_time;
-    new_result.finish_time = result.finish_time;
+    new_result.start_time = result.getStartTimeVal();
+    new_result.finish_time = result.getFinishTimeVal();
 
-    new_result.exited_ok = result.exited_ok;
-    new_result.early_timeout = result.early_timeout;
+    new_result.exited_ok = 1;
+    new_result.early_timeout = 0;
 
     new_result.check_type = job->check_type;
     new_result.check_options = job->check_options;
@@ -177,9 +175,10 @@ void processHostCheckInitiate(nebstruct_host_check_data* state) {
     auto job = std::make_shared<Job>();
     job->host_name = std::string(state->host_name);
     job->command_line = std::string(processed_command);
-    job->time_scheduled = state->timestamp.tv_sec;
+    job->time_scheduled = std::chrono::system_clock::from_time_t(state->timestamp.tv_sec);
     job->time_expires =
-        job->time_scheduled + ((state->timeout > 0) ? (state->timeout) : (default_timeout));
+        job->time_scheduled + std::chrono::seconds(
+            (state->timeout > 0) ? (state->timeout) : (default_timeout));
 
     job->check_options = obj->check_options;
     job->check_type = state->check_type;
@@ -198,9 +197,10 @@ void processServiceCheckInitiate(nebstruct_service_check_data* state) {
     job->host_name = std::string(state->host_name);
     job->service_description = std::string(state->service_description);
     job->command_line = std::string(state->command_line);
-    job->time_scheduled = state->timestamp.tv_sec;
+    job->time_scheduled = std::chrono::system_clock::from_time_t(state->timestamp.tv_sec);
     job->time_expires =
-        job->time_scheduled + ((state->timeout > 0) ? (state->timeout) : (default_timeout));
+        job->time_scheduled + std::chrono::seconds(
+            (state->timeout > 0) ? (state->timeout) : (default_timeout));
 
     job->check_options = cri->check_options;
     job->check_type = state->check_type;
@@ -239,7 +239,7 @@ int handleNebNagiosCheckInitiate(int which, void* obj) {
 
 void processTimedOutChecks() {
     JobPtr expired;
-    while ((expired = getJobQueue()->getNextExpiredJob(std::time(nullptr))) != nullptr) {
+    while ((expired = getJobQueue()->getNextExpiredJob(std::chrono::system_clock::now())) != nullptr) {
         processTimeout(expired);
     }
 }

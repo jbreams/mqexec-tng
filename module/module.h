@@ -1,5 +1,3 @@
-#pragma once
-
 #include <ctime>
 #include <memory>
 #include <queue>
@@ -7,36 +5,9 @@
 #include <unordered_map>
 #include <vector>
 
-struct Job {
-    int64_t id;
-    std::string host_name;
-    std::string service_description;
+#include "mqexec_shared.h"
 
-    std::string command_line;
-
-    std::time_t time_scheduled;
-    std::time_t time_expires;
-
-    int check_type;
-    int check_options;
-    double latency;
-};
-
-using JobPtr = std::shared_ptr<Job>;
-using JobWeakPtr = std::weak_ptr<Job>;
-
-bool operator>(const JobWeakPtr& lhs, const JobWeakPtr& rhs);
-
-using CheckMap = std::unordered_map<std::string, JobPtr>;
-
-struct Result {
-    std::string output;
-    int return_code;
-    struct timeval start_time;
-    struct timeval finish_time;
-    int exited_ok;
-    int early_timeout;
-};
+using JobMap = std::unordered_map<std::string, JobPtr>;
 
 void processTimeout(JobPtr job);
 void processJobError(JobPtr job, std::string errmsg);
@@ -63,7 +34,7 @@ struct JobQueue {
         return ret;
     }
 
-    JobPtr getNextExpiredJob(std::time_t time) {
+    JobPtr getNextExpiredJob(TimePoint time) {
         if (expiry_queue.size() == 0)
             return nullptr;
 
@@ -81,7 +52,7 @@ struct JobQueue {
     }
 
 private:
-    static CheckMap _placeholder;
+    static JobMap _placeholder;
     static uint64_t next_id;
 };
 

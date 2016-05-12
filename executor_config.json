@@ -1,0 +1,4 @@
+{
+    "server_uri": "tcp://127.0.0.1:25678",
+    "executor_name": "localhost"
+}
