@@ -10,5 +10,5 @@ endif()
 add_library(modmqexec-tng SHARED)
 target_sources(modmqexec-tng PRIVATE frontend.cpp backend.cpp)
 
-target_link_libraries(modmqexec-tng zmqpp-static cereal shared json)
+target_link_libraries(modmqexec-tng zmqpp-static cereal shared json ${CMAKE_THREAD_LIBS_INIT})
 include_directories(${NAGIOS_INCLUDE})

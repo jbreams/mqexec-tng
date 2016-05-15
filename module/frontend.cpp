@@ -3,6 +3,7 @@
 #include <set>
 #include <vector>
 
+extern "C" {
 #include "nebstructs.h"
 #include "nebcallbacks.h"
 #include "nebmodules.h"
@@ -13,6 +14,7 @@
 #else
 #include "nagios.h"
 #endif
+}
 
 #include "cereal/cereal.hpp"
 #include "cereal/types/string.hpp"
@@ -29,8 +31,6 @@
 
 #include "module.h"
 
-extern iobroker_set* nagios_iobs;
-
 namespace {
 std::unique_ptr<zmqpp::context> zmq_ctx = nullptr;
 std::unique_ptr<zmqpp::socket> server_socket = nullptr;
@@ -45,32 +45,54 @@ void dispatchJob(JobPtr job, std::string executor) {
     const auto job_id = getJobQueue()->addCheck(job);
     try {
         zmqpp::message req_msg;
+        log_debug_info(DEBUGL_CHECKS, DEBUGV_BASIC,
+            "Dispatching check to %s (id: %lu hostname: %s service: %s)\n",
+            executor.c_str(), job_id, job->host_name.c_str(), job->service_description.c_str());
         req_msg.add(executor);
         std::ostringstream req_buffer;
 
         cereal::PortableBinaryOutputArchive archive(req_buffer);
-        archive(job);
+        archive(*job);
         req_msg.add(req_buffer.str());
         server_socket->send(req_msg);
-    } catch (std::exception e) {
+    } catch (zmqpp::zmq_internal_exception& e) {
+        std::stringstream ss;
+        if (e.zmq_error() == EHOSTUNREACH) {
+            ss << "Executor " << executor << " is not connected";
+        } else {
+            ss << "ZeroMQ error while dispatching job to " << executor << ": " << e.what();
+        }
+        auto error_msg = ss.str();
+        processJobError(job, error_msg);
+        logit(NSLOG_RUNTIME_WARNING, TRUE, error_msg.c_str());
+        getJobQueue()->getCheck(job_id);
+    } catch (std::exception& e) {
         std::stringstream ss;
         ss << "Error sending job to executor: " << e.what();
-        processJobError(job, ss.str());
+        auto error_message = ss.str();
+        processJobError(job, error_message);
+        logit(NSLOG_RUNTIME_WARNING, TRUE, error_message.c_str());
         getJobQueue()->getCheck(job_id);
     }
 }
 
 int processIOEvent(int sd, int events, void* arg) {
+    log_debug_info(DEBUGL_CHECKS, DEBUGV_MORE, "Entering mqexec I/O callback\n");
     for (;;) {
-        zmqpp::message raw_msg;
         try {
-            if (!server_socket->receive(raw_msg, false))
+            log_debug_info(DEBUGL_CHECKS, DEBUGV_MORE, "Entering mqexec receive loop\n");
+            zmqpp::message raw_msg;
+            if (!server_socket->receive(raw_msg, true))
                 break;
-
-            if (raw_msg.parts() == 0)
+            const auto last_part = raw_msg.parts() - 1;
+            if (raw_msg.parts() == 0 || raw_msg.get(last_part).size() == 0) {
+                log_debug_info(DEBUGL_CHECKS, DEBUGV_MORE,
+                    "Skipping mqexec message with empty payload\n");
                 continue;
+            }
 
-            std::istringstream response_buf(raw_msg.get(1));
+            log_debug_info(DEBUGL_CHECKS, DEBUGV_BASIC, "Received mqexec message\n");
+            std::istringstream response_buf(raw_msg.get(last_part));
             cereal::PortableBinaryInputArchive archive(response_buf);
 
             Result res;
@@ -78,28 +100,52 @@ int processIOEvent(int sd, int events, void* arg) {
             const auto job = getJobQueue()->getCheck(res.id);
             processResult(job, res);
         } catch (std::exception e) {
-            logit(NSLOG_RUNTIME_ERROR, TRUE, "Error receiving result from executor: %s", e.what());
+            logit(NSLOG_RUNTIME_ERROR,
+                    TRUE, "Error receiving result from executor: %s", e.what());
         }
+    }
+    log_debug_info(DEBUGL_CHECKS, DEBUGV_MORE, "Leaving mqexec I/O callback\n");
+
+    return 0;
+}
+
+int shutdownServer() {
+    try {
+        int fd;
+        server_socket->get(zmqpp::socket_option::file_descriptor, fd);
+        iobroker_unregister(nagios_iobs, fd);
+
+        server_socket->close();
+        server_socket = nullptr;
+        zmq_ctx->terminate();
+        zmq_ctx = nullptr;
+        zmq_authenticator = nullptr;
+    } catch (std::exception& e) {
+        logit(NSLOG_RUNTIME_ERROR, TRUE, "Error shutting down MQexec! %s", e.what());
+        return 1;
     }
     return 0;
 }
 
-void initServer(std::string bind_point, std::string key_file_path, zmqpp::curve::keypair keys) {
+int initServer(std::string bind_point, std::string key_file_path, zmqpp::curve::keypair keys) {
     if (zmq_ctx || server_socket || zmq_authenticator) {
-        throw std::runtime_error("ZeroMQ shouldn't be initialized yet!");
+        logit(NSLOG_RUNTIME_ERROR, TRUE, "ZeroMQ shouldn't be inititalized yet!");
+        return 1;
     }
+    logit(NSLOG_INFO_MESSAGE, TRUE, "Setting up MQexec");
     zmq_ctx = std::unique_ptr<zmqpp::context>(new zmqpp::context{});
     server_socket =
         std::unique_ptr<zmqpp::socket>(new zmqpp::socket(*zmq_ctx, zmqpp::socket_type::router));
 
     if (!keys.secret_key.empty()) {
+        logit(DEBUGL_PROCESS, DEBUGV_BASIC, "Configuring curve security for mqexec");
         server_socket->set(zmqpp::socket_option::curve_secret_key, keys.secret_key);
         server_socket->set(zmqpp::socket_option::curve_public_key, keys.public_key);
-        const int as_server = 1;
-        server_socket->set(zmqpp::socket_option::curve_server, as_server);
+        server_socket->set(zmqpp::socket_option::curve_server, true);
     }
 
     if (!key_file_path.empty()) {
+        logit(DEBUGL_PROCESS, DEBUGV_BASIC, "Configuring curve authorization file for mqexec");
         zmq_authenticator = std::unique_ptr<zmqpp::auth>(new zmqpp::auth(*zmq_ctx));
 
         std::ifstream key_file_fp;
@@ -119,68 +165,81 @@ void initServer(std::string bind_point, std::string key_file_path, zmqpp::curve:
             // a comment.
             if (line_trimmed.size() < 40 || line_trimmed[0] == '#')
                 continue;
+            auto key = line_trimmed.substr(0, 40);
+            logit(DEBUGL_CONFIG, DEBUGV_MOST, "Adding trusted key %s", key.c_str());
 
             // We take the first 40 characters as z85 encoded keys.
-            zmq_authenticator->configure_curve(line_trimmed.substr(0, 40));
+            zmq_authenticator->configure_curve(key);
         }
     }
 
     server_socket->set(zmqpp::socket_option::router_mandatory, 1);
-    server_socket->set(zmqpp::socket_option::probe_router, 1);
 
-    server_socket->bind(bind_point);
+    try {
+        logit(NSLOG_INFO_MESSAGE, TRUE, "Binding mqexec to %s", bind_point.c_str());
+        server_socket->bind(bind_point);
+    } catch (zmqpp::zmq_internal_exception& e) {
+        logit(NSLOG_RUNTIME_ERROR, TRUE, "Error binding mqexec to %s: %s",
+            bind_point.c_str(), e.what());
+        shutdownServer();
+        return 1;
+    }
 
     int fd;
     server_socket->get(zmqpp::socket_option::file_descriptor, fd);
     iobroker_register(nagios_iobs, fd, nullptr, processIOEvent);
 }
 
-void shutdownServer() {
-    server_socket->close();
-    server_socket = nullptr;
-    zmq_ctx->terminate();
-    zmq_ctx = nullptr;
-    zmq_authenticator = nullptr;
-}
-
-// NEB_API_VERSION(CURRENT_NEB_API_VERSION)
+NEB_API_VERSION(CURRENT_NEB_API_VERSION)
 nebmodule* handle;
 
 int handleStartup(int which, void* obj) {
     struct nebstruct_process_struct* ps = static_cast<struct nebstruct_process_struct*>(obj);
 
-    switch (ps->type) {
-        case NEBTYPE_PROCESS_EVENTLOOPSTART: {
-            std::string allowed_key_file;
-            if (config_file_obj.find("allowed_keys_file") != config_file_obj.end()) {
-                allowed_key_file = config_file_obj.at("allowed_keys_file").get<std::string>();
-            }
+    try {
+        switch (ps->type) {
+            case NEBTYPE_PROCESS_EVENTLOOPSTART: {
+                std::string allowed_key_file;
+                if (config_file_obj.find("allowed_keys_file") != config_file_obj.end()) {
+                    allowed_key_file = config_file_obj.at("allowed_keys_file").get<std::string>();
+                }
 
-            zmqpp::curve::keypair keys;
-            if (config_file_obj.find("curve_keys") != config_file_obj.end()) {
-                auto curve_keys = config_file_obj["curve_keys"];
-                keys.public_key = curve_keys.at("public").get<std::string>();
-                keys.secret_key = curve_keys.at("secret").get<std::string>();
-            }
+                zmqpp::curve::keypair keys;
+                if (config_file_obj.find("curve_keys") != config_file_obj.end()) {
+                    auto curve_keys = config_file_obj["curve_keys"];
+                    keys.public_key = curve_keys.at("public").get<std::string>();
+                    keys.secret_key = curve_keys.at("secret").get<std::string>();
+                }
 
-            initServer(
-                config_file_obj.at("bind_address").get<std::string>(), allowed_key_file, keys);
-        } break;
-        case NEBTYPE_PROCESS_EVENTLOOPEND: {
-            shutdownServer();
-        } break;
+                if (config_file_obj.find("bind_address") == config_file_obj.end()) {
+                    logit(NSLOG_RUNTIME_ERROR, TRUE, "MQexec config file is missing a bind address!");
+                    return 1;
+                }
+
+                return initServer(
+                    config_file_obj.at("bind_address").get<std::string>(), allowed_key_file, keys);
+            } break;
+            case NEBTYPE_PROCESS_EVENTLOOPEND: {
+                return shutdownServer();
+            } break;
+        }
+    } catch (std::exception& e) {
+        logit(NSLOG_RUNTIME_ERROR, TRUE, "Uncaught exception while starting mqexec!: %s", e.what());
+        return 1;
     }
     return 0;
 }
 
 int loadConfigFile(char* localargs) {
     try {
-        std::ifstream config_file_obj_fp;
-        config_file_obj_fp.exceptions(std::ifstream::failbit | std::ifstream::badbit);
-        config_file_obj_fp.open(localargs);
+        std::ifstream config_file_obj_fp(localargs);
+        if (!config_file_obj_fp) {
+            logit(NSLOG_RUNTIME_ERROR, TRUE, "Error opening config file");
+            return 1;
+        }
 
         config_file_obj = json::parse(config_file_obj_fp);
-    } catch (std::exception e) {
+    } catch (std::exception& e) {
         logit(NSLOG_RUNTIME_ERROR, TRUE, "Error loading config file: %s", e.what());
         return 1;
     }
@@ -195,9 +254,7 @@ extern int __nagios_object_structure_version;
 
 int nebmodule_deinit(int flags, int reason) {
     neb_deregister_module_callbacks(handle);
-#ifdef HAVE_SHUTDOWN_COMMAND_FILE_WORKER
     shutdown_command_file_worker();
-#endif
     return 0;
 }
 

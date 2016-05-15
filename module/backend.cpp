@@ -17,14 +17,6 @@
 
 #include "module.h"
 
-bool operator>(const JobWeakPtr& lhs, const JobWeakPtr& rhs) {
-    auto rlhs = lhs.lock();
-    auto rrhs = rhs.lock();
-    if (!rlhs || !rlhs)
-        return true;
-    return rlhs->time_expires > rrhs->time_expires;
-}
-
 std::shared_ptr<JobQueue> job_queue;
 std::shared_ptr<JobQueue> getJobQueue() {
     if (job_queue == nullptr)
@@ -47,6 +39,9 @@ struct check_engine mqexec_check_engine = {
     const_cast<char*>(engine_name), mqexec_source_name, std::free};
 
 void processJobError(JobPtr job, std::string errmsg) {
+    log_debug_info(DEBUGL_EVENTS, DEBUGV_BASIC,
+        "Sending error check result for mqexec job (id: %lu host: %s service: %s)\n",
+        job->id, job->host_name.c_str(), job->service_description.c_str());
     const Result res = {job->id,
                         errmsg,
                         job->service_description.empty() ? 3 : 1,
@@ -56,6 +51,9 @@ void processJobError(JobPtr job, std::string errmsg) {
 }
 
 void processTimeout(JobPtr job) {
+    log_debug_info(DEBUGL_EVENTS, DEBUGV_BASIC,
+        "Sending timeout check result for mqexec job (id: %lu host: %s service: %s)\n",
+        job->id, job->host_name.c_str(), job->service_description.c_str());
     const Result res = {job->id,
                         "Check timed out",
                         job->service_description.empty() ? 3 : 1,
@@ -63,8 +61,6 @@ void processTimeout(JobPtr job) {
                         std::chrono::system_clock::now()};
     processResult(job, res);
 }
-
-namespace {
 
 void sendResultToNagios(check_result& new_result) {
     new_result.engine = &mqexec_check_engine;
@@ -77,6 +73,10 @@ void processResult(JobPtr job, const Result& result) {
     init_check_result(&new_result);
     new_result.output_file = NULL;
     new_result.output_file_fp = NULL;
+
+    log_debug_info(DEBUGL_EVENTS, DEBUGV_BASIC,
+        "Processing mqexec check result (id: %lu host: %s service: %s)\n",
+        job->id, job->host_name.c_str(), job->service_description.c_str());
 
     new_result.host_name = strdup(job->host_name.c_str());
     if (!job->service_description.empty()) {
@@ -160,6 +160,32 @@ std::string getExecutorName(customvariablesmember* vars) {
     return "";
 }
 
+bool shouldOverrideCheck(customvariablesmember* vars) {
+    while (vars != nullptr) {
+        if (std::strcmp(vars->variable_name, "_MQEXEC_IGNORE") == 0)
+            return (std::strcmp(vars->variable_value, "true") != 0);
+        vars = vars->next;
+    }
+    return true;
+}
+
+void scheduleTimeout(JobPtr jobptr) {
+    JobWeakPtr weak_job(jobptr);
+    log_debug_info(DEBUGL_CHECKS, DEBUGV_MORE, "Scheduling timeout in mqexec\n");
+    std::function<void(void*)> expire_fn = [&weak_job](void* unused) {
+        if (auto job = weak_job.lock()) {
+            logit(NSLOG_INFO_MESSAGE, FALSE, "Timing out check (hostname: %s service: %s)\n",
+                    job->host_name.c_str(), job->service_description.c_str());
+            getJobQueue()->getCheck(job->id);
+            processTimeout(job);
+        }
+    };
+
+    auto expiry_time = std::chrono::system_clock::to_time_t(jobptr->time_expires);
+    schedule_new_event(EVENT_USER_FUNCTION,
+            TRUE, expiry_time, FALSE, 0, NULL, TRUE, expire_fn.target<void*>(), NULL, 0);
+}
+
 void processHostCheckInitiate(nebstruct_host_check_data* state) {
     host* obj = (host*)state->object_ptr;
 
@@ -168,6 +194,7 @@ void processHostCheckInitiate(nebstruct_host_check_data* state) {
     int old_current_attempt = obj->current_attempt;
     obj->latency = state->latency;
 
+    log_debug_info(DEBUGL_CHECKS, DEBUGV_MORE, "Entering mqexec service check dispatcher\n");
     if (fixup_async_presync_hostcheck(obj, &processed_command) != 0)
         return;
     std::unique_ptr<char> processed_command_guard(processed_command);
@@ -185,6 +212,7 @@ void processHostCheckInitiate(nebstruct_host_check_data* state) {
     job->latency = state->latency;
 
     dispatchJob(job, getExecutorName(obj->custom_variables));
+    scheduleTimeout(job);
 
     obj->latency = old_latency;
     obj->current_attempt = old_current_attempt;
@@ -194,6 +222,8 @@ void processServiceCheckInitiate(nebstruct_service_check_data* state) {
     const service* obj = (service*)state->object_ptr;
     check_result* cri = state->check_result_ptr;
     auto job = std::make_shared<Job>();
+
+    log_debug_info(DEBUGL_CHECKS, DEBUGV_MORE, "Entering mqexec service check dispatcher\n");
     job->host_name = std::string(state->host_name);
     job->service_description = std::string(state->service_description);
     job->command_line = std::string(state->command_line);
@@ -207,7 +237,7 @@ void processServiceCheckInitiate(nebstruct_service_check_data* state) {
     job->latency = state->latency;
 
     dispatchJob(job, getExecutorName(obj->custom_variables));
-}
+    scheduleTimeout(job);
 }
 
 int handleNebNagiosCheckInitiate(int which, void* obj) {
@@ -218,6 +248,13 @@ int handleNebNagiosCheckInitiate(int which, void* obj) {
             if (raw->type != NEBTYPE_HOSTCHECK_ASYNC_PRECHECK)
                 return 0;
             try {
+                auto state = static_cast<nebstruct_host_check_data*>(obj);
+                auto vars = (static_cast<service*>(state->object_ptr))->custom_variables;
+                if (!shouldOverrideCheck(vars)) {
+
+                    return 0;
+                }
+
                 processHostCheckInitiate(static_cast<nebstruct_host_check_data*>(obj));
             } catch (std::exception e) {
                 logit(NSLOG_RUNTIME_ERROR, TRUE, "Error processing host check for %s", e.what());
@@ -227,7 +264,12 @@ int handleNebNagiosCheckInitiate(int which, void* obj) {
             if (raw->type != NEBTYPE_SERVICECHECK_INITIATE)
                 return 0;
             try {
-                processServiceCheckInitiate(static_cast<nebstruct_service_check_data*>(obj));
+                auto state = static_cast<nebstruct_service_check_data*>(obj);
+                auto vars = (static_cast<service*>(state->object_ptr))->custom_variables;
+                if (!shouldOverrideCheck(vars))
+                    return 0;
+
+                processServiceCheckInitiate(state);
             } catch (std::exception e) {
                 logit(NSLOG_RUNTIME_ERROR, TRUE, "Error processing host check for %s", e.what());
             }
@@ -237,9 +279,3 @@ int handleNebNagiosCheckInitiate(int which, void* obj) {
     }
 }
 
-void processTimedOutChecks() {
-    JobPtr expired;
-    while ((expired = getJobQueue()->getNextExpiredJob(std::chrono::system_clock::now())) != nullptr) {
-        processTimeout(expired);
-    }
-}
