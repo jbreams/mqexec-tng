@@ -44,6 +44,7 @@ void dispatchJob(JobPtr job, std::string executor) {
 
     const auto job_id = getJobQueue()->addCheck(job);
     try {
+        scheduleTimeout(job);
         zmqpp::message req_msg;
         log_debug_info(DEBUGL_CHECKS, DEBUGV_BASIC,
             "Dispatching check to %s (id: %lu hostname: %s service: %s)\n",
@@ -55,6 +56,7 @@ void dispatchJob(JobPtr job, std::string executor) {
         archive(*job);
         req_msg.add(req_buffer.str());
         server_socket->send(req_msg);
+        log_debug_info(DEBUGL_CHECKS, DEBUGV_MORE, "MQexec sent check successfully\n");
     } catch (zmqpp::zmq_internal_exception& e) {
         std::stringstream ss;
         if (e.zmq_error() == EHOSTUNREACH) {

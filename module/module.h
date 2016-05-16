@@ -41,3 +41,4 @@ private:
 int handleNebNagiosCheckInitiate(int which, void* obj);
 std::shared_ptr<JobQueue> getJobQueue();
 void dispatchJob(JobPtr job, std::string executor);
+void scheduleTimeout(JobPtr jobptr);

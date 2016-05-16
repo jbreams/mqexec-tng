@@ -17,6 +17,8 @@ struct Job {
 
     int check_type;
     int check_options;
+    int scheduled_check;
+    int reschedule_check;
     double latency;
 
     template <class Archive>
