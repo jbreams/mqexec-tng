@@ -96,49 +96,87 @@ private:
 
 class RunnerThread {
 public:
-    RunnerThread(zmqpp::socket _sock) : sock{std::move(_sock)} {};
+    RunnerThread(zmqpp::socket _sock, int _worker) : sock{std::move(_sock)}, worker{_worker} {};
 
     void operator()() {
+        {
+            std::stringstream ss;
+            ss << "worker #" << worker;
+            loguru::set_thread_name(ss.str().c_str());
+        }
+        sigset_t set;
+        sigfillset(&set);
+        sigprocmask(SIG_SETMASK, &set, nullptr);
+
         for (;;) {
             zmqpp::message msg;
-            if (!sock.receive(msg))
-                break;
+            try {
+                sock.receive(msg);
+            } catch (zmqpp::zmq_internal_exception& e) {
+                if (e.zmq_error() == ETERM) {
+                    break;
+                }
+                LOG_S(ERROR) << "Error receiving job from nagios: " << e.what();
+                continue;
+            }
+
+            LOG_S(1) << "Received job from nagios";
             const int last_part = msg.parts() - 1;
             Job job;
-            {
+            try {
                 const std::string msg_buf = msg.get(last_part);
                 std::istringstream msg_stream(msg_buf);
                 cereal::PortableBinaryInputArchive archive(msg_stream);
                 archive(job);
+            } catch (std::exception& e) {
+                LOG_S(ERROR) << "Error decoding job from nagios: " << e.what();
+                continue;
             }
 
-            Result res = runProgram(job);
+            Result res;
+            try {
+                res = runProgram(job);
+            } catch (std::exception& e) {
+                LOG_S(ERROR) << "Error running job: " << e.what();
+                continue;
+            }
             zmqpp::message response;
             for (auto i = 0; i < last_part; i++) {
                 response.add(msg.get(i));
             }
 
-            {
+            try {
                 std::ostringstream msg_buf;
                 cereal::PortableBinaryOutputArchive archive(msg_buf);
                 archive(res);
                 response.add(msg_buf.str());
+            } catch (std::exception& e) {
+                LOG_S(ERROR) << "Error encoding result to send to nagios: " << e.what();
+                continue;
             }
 
-            sock.send(response);
+            try {
+                sock.send(response);
+            } catch (zmqpp::zmq_internal_exception& e) {
+                if (e.zmq_error() == ETERM)
+                    break;
+                LOG_S(ERROR) << "Error sending result to nagios: " << e.what();
+                continue;
+            }
+            LOG_S(1) << "Sent result back to nagios";
         }
     };
 
     Result runProgram(Job& job) {
+        LOG_SCOPE_FUNCTION(1);
         WordExpWrapper command_line_parsed(job.command_line.c_str());
+        LOG_S(1) << "Parsed command line for " << command_line_parsed.progName();
 
         int pipes[2];
         if (pipe(pipes) == -1) {
             throw std::system_error(errno, std::system_category());
         }
 
-        LOG_S(1) << "Running job for " << job.host_name << "@" << job.service_description << ": "
-                 << job.command_line;
         auto start_time = std::chrono::system_clock::now();
         pid_t pid = fork();
         if (pid == 0) {
@@ -178,16 +216,21 @@ public:
                 kill(pid, SIGTERM);
                 status = 3;
                 output << "Task timed out\n";
+                LOG_S(WARNING) << "Job timed out running " << command_line_parsed.progName();
                 break;
             }
 
             int poll_res = poll(&poller, 1, timeout.count());
-            if (poll_res == 0 || poller.revents & POLLERR)
+            if (poll_res == 0 || poller.revents & POLLERR) {
+                LOG_S(1) << "Poll returned, but there were no useful events!";
                 continue;
+            }
 
             std::array<char, 128> read_buf;
             read_bytes = read(pipes[0], read_buf.data(), read_buf.size());
             if (read_bytes > 0) {
+                LOG_S(1) << "Captured " << read_bytes << " of output from "
+                         << command_line_parsed.progName();
                 output.write(read_buf.data(), read_bytes);
             }
             if (read_bytes == -1) {
@@ -198,12 +241,14 @@ public:
 
         close(pipes[0]);
         status = WEXITSTATUS(status);
+        LOG_S(1) << command_line_parsed.progName() << " finished with exit code " << status;
 
         return {job.id, output.str(), status, start_time, finish_time};
     }
 
 private:
     zmqpp::socket sock;
+    int worker;
 };
 
 int main(int argc, char** argv) {
@@ -212,13 +257,13 @@ int main(int argc, char** argv) {
     signal(SIGTERM, SIG_DFL);
 
     if (argc < 2) {
-        LOG_S(ERROR) << "Missing path to config file" << std::endl;
+        LOG_S(ERROR) << "Missing path to config file";
         return 1;
     }
 
     std::ifstream config_file_fp(argv[1]);
     if (!config_file_fp.is_open()) {
-        LOG_S(ERROR) << "Could not open config file " << argv[1] << std::endl;
+        LOG_S(ERROR) << "Could not open config file " << argv[1];
         return 1;
     }
 
@@ -226,13 +271,17 @@ int main(int argc, char** argv) {
     try {
         config_obj = json::parse(config_file_fp);
     } catch (std::exception& e) {
-        LOG_S(ERROR) << "Error parsing config file " << e.what() << std::endl;
+        LOG_S(ERROR) << "Error parsing config file " << e.what();
         return 1;
     }
 
     if (config_obj.find("use_syslog") != config_obj.end() && config_obj["use_syslog"].get<bool>()) {
-        loguru::add_callback("syslog", syslog_log_callback, nullptr, loguru::Verbosity_INFO,
-                syslog_empty_callback, syslog_empty_callback);
+        loguru::add_callback("syslog",
+                             syslog_log_callback,
+                             nullptr,
+                             loguru::Verbosity_INFO,
+                             syslog_empty_callback,
+                             syslog_empty_callback);
     }
 
     if (config_obj.find("verbose") != config_obj.end() && config_obj["verbose"].get<bool>()) {
@@ -251,34 +300,34 @@ int main(int argc, char** argv) {
                           curve_keys["secret"].get<std::string>());
         master_socket.set(zmqpp::socket_option::curve_public_key, public_key);
         master_socket.set(zmqpp::socket_option::curve_server_key, server_key);
-        LOG_S(INFO) << "Setting up curve keys" << std::endl;
-        LOG_S(1) << "Public key: " << public_key << std::endl;
-        LOG_S(1) << "Server key: " << server_key << std::endl;
+        LOG_S(INFO) << "Setting up curve keys";
+        LOG_S(1) << "Public key: " << public_key;
+        LOG_S(1) << "Server key: " << server_key;
     }
 
     if (config_obj.find("executor_name") != config_obj.end()) {
         auto executor_name = config_obj["executor_name"].get<std::string>();
         master_socket.set(zmqpp::socket_option::identity, executor_name);
-        LOG_S(INFO) << "Setting executor name from config: " << executor_name << std::endl;
+        LOG_S(INFO) << "Setting executor name from config: " << executor_name;
     } else {
         std::string hostname;
         hostname.reserve(sysconf(_SC_HOST_NAME_MAX) + 1);
         if (gethostname(const_cast<char*>(hostname.data()), hostname.size()) == -1) {
-            LOG_S(FATAL) << "Error getting hostname: " << strerror(errno) << std::endl;
+            LOG_S(FATAL) << "Error getting hostname: " << strerror(errno);
             return 1;
         }
         master_socket.set(zmqpp::socket_option::identity, hostname);
-        LOG_S(INFO) << "Setting executor name from hostname: " << hostname << std::endl;
+        LOG_S(INFO) << "Setting executor name from hostname: " << hostname;
     }
 
     if (config_obj.find("server_uri") == config_obj.end()) {
-        LOG_S(FATAL) << "Config must specify server_uri parameter" << std::endl;
+        LOG_S(FATAL) << "Config must specify server_uri parameter";
         return 1;
     }
 
     auto server_uri = config_obj["server_uri"].get<std::string>();
     master_socket.connect(server_uri);
-    LOG_S(INFO) << "Connecting to " << server_uri << std::endl;
+    LOG_S(INFO) << "Connecting to " << server_uri;
 
     zmqpp::socket distributor_socket(zmq_ctx, zmqpp::socket_type::dealer);
     distributor_socket.bind("inproc://work_distributor");
@@ -288,11 +337,12 @@ int main(int argc, char** argv) {
         workers = config_obj["workers"].get<int>();
     }
 
+    LOG_S(INFO) << "Starting " << workers << " worker threads";
     for (auto i = 0; i < workers; i++) {
         zmqpp::socket worker_socket(zmq_ctx, zmqpp::socket_type::dealer);
         worker_socket.connect("inproc://work_distributor");
 
-        std::thread worker(RunnerThread(std::move(worker_socket)));
+        std::thread worker(RunnerThread(std::move(worker_socket), i));
         worker.detach();
     }
 
@@ -304,14 +354,30 @@ int main(int argc, char** argv) {
 
         if (proxy_poller.has_input(master_socket)) {
             zmqpp::message msg;
-            master_socket.receive(msg);
-            distributor_socket.send(msg);
+            try {
+                master_socket.receive(msg);
+                distributor_socket.send(msg);
+            } catch (zmqpp::zmq_internal_exception& e) {
+                if (e.zmq_error() == ETERM)
+                    break;
+                LOG_S(ERROR) << "Error receiving job nagios (main thread) " << e.what();
+                continue;
+            }
+            LOG_S(1) << "Received job from nagios (main thread)";
         }
 
         if (proxy_poller.has_input(distributor_socket)) {
             zmqpp::message msg;
-            distributor_socket.receive(msg);
-            master_socket.send(msg);
+            try {
+                distributor_socket.receive(msg);
+                master_socket.send(msg);
+            } catch (zmqpp::zmq_internal_exception& e) {
+                if (e.zmq_error() == ETERM)
+                    break;
+                LOG_S(ERROR) << "Error sending result to nagios (main thread) " << e.what();
+                continue;
+            }
+            LOG_S(1) << "Sent result back to nagios (main thread)";
         }
     }
     return 0;

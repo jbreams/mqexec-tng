@@ -1,5 +1,6 @@
 {
     "server_uri": "tcp://127.0.0.1:25678",
     "executor_name": "localhost",
-    "use_syslog": true
+    "use_syslog": true,
+    "verbose": true
 }

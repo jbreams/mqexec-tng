@@ -1,12 +1,12 @@
 #include "json.hpp"
-#include "zmqpp/zmqpp.hpp"
 #include "zmqpp/curve.hpp"
+#include "zmqpp/zmqpp.hpp"
 
+#include "cereal/archives/portable_binary.hpp"
 #include "cereal/cereal.hpp"
 #include "cereal/types/chrono.hpp"
-#include "cereal/types/string.hpp"
 #include "cereal/types/memory.hpp"
-#include "cereal/archives/portable_binary.hpp"
+#include "cereal/types/string.hpp"
 
 #include "mqexec_shared.h"
 
@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
 
         auto scheduled = std::chrono::system_clock::now();
         auto expires = scheduled + std::chrono::seconds(10);
-        Job j = { static_cast<uint64_t>(i), "foo", "bar", ss.str(), scheduled, expires, 0, 0, 0.0 };
+        Job j = {static_cast<uint64_t>(i), "foo", "bar", ss.str(), scheduled, expires, 0, 0, 0.0};
 
         zmqpp::message msg;
         msg.add(argv[2]);
@@ -58,9 +58,9 @@ int main(int argc, char** argv) {
         std::istringstream response_buf(msg.get(last_part));
         Result res;
         try {
-        cereal::PortableBinaryInputArchive archive(response_buf);
-        archive(res);
-        } catch(std::exception e) {
+            cereal::PortableBinaryInputArchive archive(response_buf);
+            archive(res);
+        } catch (std::exception e) {
             std::cerr << "Error receiving response: " << e.what();
             continue;
         }
