@@ -101,7 +101,7 @@ int processIOEvent(int sd, int events, void* arg) {
             archive(res);
             const auto job = getJobQueue()->getCheck(res.id);
             processResult(job, res);
-        } catch (std::exception e) {
+        } catch (std::exception& e) {
             logit(NSLOG_RUNTIME_ERROR,
                     TRUE, "Error receiving result from executor: %s", e.what());
         }
